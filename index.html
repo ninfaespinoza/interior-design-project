@@ -1713,27 +1713,22 @@ function feToast(msg){
   clearTimeout(t._tm); t._tm=setTimeout(function(){ t.style.transition='opacity .4s'; t.style.opacity='0'; }, 3000);
 }
 
-/* ===== PROTOTYPE AUTH (self-contained, free) =====
- * No external provider. Accounts + the signed-in session live in this browser
- * (localStorage). Great for the prototype phase; swap in a real backend later. */
+/* ===== AUTH (Firebase Authentication) =====
+ * Real, secure accounts handled by Firebase (see the `type="module"` script
+ * near the end of this file). Passwords are NEVER stored by this app — Firebase
+ * hashes and manages them. The classic code below drives the login UI and calls
+ * window.FB.* for the actual sign-in / sign-up / reset operations, while
+ * window.onFirebaseAuth() reacts to the signed-in state. */
 let _currentUser = null;
-const AUTH_USERS_KEY = 'idp_proto_users';
-const AUTH_SESSION_KEY = 'idp_proto_session';
+/* One-time cleanup: remove the old prototype accounts + session that used to be
+ * kept in PLAIN TEXT in this browser. No longer used or needed. */
+try { localStorage.removeItem('idp_proto_users'); localStorage.removeItem('idp_proto_session'); } catch(e) {}
 
-function _readUsers() {
-  try { return JSON.parse(localStorage.getItem(AUTH_USERS_KEY) || '{}'); } catch(e) { return {}; }
-}
-function _writeUsers(u) {
-  try { localStorage.setItem(AUTH_USERS_KEY, JSON.stringify(u)); } catch(e) {}
-}
-function _saveSession(user) {
-  try { localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(user)); } catch(e) {}
-}
-function _loadSession() {
-  try { return JSON.parse(localStorage.getItem(AUTH_SESSION_KEY) || 'null'); } catch(e) { return null; }
-}
-function _clearSession() {
-  try { localStorage.removeItem(AUTH_SESSION_KEY); } catch(e) {}
+function _authBusy(on) {
+  ['authLoginBtn','authSignupBtn','authGoogleBtn'].forEach(function(id){
+    var b = document.getElementById(id);
+    if (b) { b.disabled = !!on; b.style.opacity = on ? '.6' : ''; b.style.pointerEvents = on ? 'none' : ''; }
+  });
 }
 
 /* ===== AUTH UI ===== */
@@ -1752,11 +1747,15 @@ function buildAuthScreen() {
         <input class="auth-input" type="email" id="authEmail" placeholder="Email address" autocomplete="email">
         <input class="auth-input" type="password" id="authPass" placeholder="Password" autocomplete="current-password">
         <div class="auth-forgot" onclick="doReset()">Forgot password?</div>
-        <button class="auth-btn auth-btn-primary" onclick="doLogin()">Sign In</button>
+        <button class="auth-btn auth-btn-primary" id="authLoginBtn" onclick="doLogin()">Sign In</button>
+        <button class="auth-btn" id="authGoogleBtn" onclick="doGoogle()" style="display:flex;align-items:center;justify-content:center;gap:9px;background:#fff;border:1px solid #dadce0;color:#3c4043;font-weight:600;margin-top:10px">
+          <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Continue with Google
+        </button>
         <div class="auth-toggle">Don't have an account? <a onclick="showSignup()">Create one</a></div>
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid #e0e0e0">
-          <button class="auth-btn" style="background:var(--purple-light);color:var(--purple);font-weight:700" onclick="demoLogin()">Continue as Guest</button>
-          <div style="font-size:10.5px;color:var(--ink4);text-align:center;margin-top:8px;font-family:var(--ui)">Prototype login — accounts are saved on this device</div>
+          <button class="auth-btn" style="background:var(--purple-light);color:var(--purple);font-weight:700" onclick="demoLogin()">Continue as Guest (preview)</button>
+          <div style="font-size:10.5px;color:var(--ink4);text-align:center;margin-top:8px;font-family:var(--ui)">🔒 Your account is secured with Firebase</div>
         </div>
       </div>
       <div id="authSignup" class="auth-hidden">
@@ -1766,7 +1765,7 @@ function buildAuthScreen() {
         <input class="auth-input" type="text" id="authName" placeholder="Full name" autocomplete="name">
         <input class="auth-input" type="email" id="authEmail2" placeholder="Email address" autocomplete="email">
         <input class="auth-input" type="password" id="authPass2" placeholder="Create password (6+ characters)" autocomplete="new-password">
-        <button class="auth-btn auth-btn-primary" onclick="doSignup()">Create Account</button>
+        <button class="auth-btn auth-btn-primary" id="authSignupBtn" onclick="doSignup()">Create Account</button>
         <div class="auth-toggle">Already have an account? <a onclick="showLogin()">Sign in</a></div>
       </div>
     </div>
@@ -1793,25 +1792,33 @@ function clearAuthErrors() {
 
 function _validEmail(e) { return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e); }
 
+function _fbNotReady(errEl) {
+  if (!window.FB || !window.FB.ready) {
+    errEl.style.color = '#d32f2f';
+    errEl.textContent = 'Still connecting to the sign-in service… please try again in a moment.';
+    return true;
+  }
+  return false;
+}
+
 function doLogin() {
-  const email = document.getElementById('authEmail').value.trim().toLowerCase();
+  const email = document.getElementById('authEmail').value.trim();
   const pass = document.getElementById('authPass').value;
   const errEl = document.getElementById('authError');
   errEl.style.color = '#d32f2f';
   errEl.textContent = '';
   if (!email || !pass) { errEl.textContent = 'Please fill in both fields.'; return; }
-  const users = _readUsers();
-  const rec = users[email];
-  if (!rec) { errEl.textContent = 'No account found with this email. Create one below.'; return; }
-  if (rec.pass !== pass) { errEl.textContent = 'Incorrect password. Try again.'; return; }
-  const user = { uid: email, email: email, displayName: rec.name || email.split('@')[0] };
-  _saveSession(user);
-  enterApp(user);
+  if (_fbNotReady(errEl)) return;
+  _authBusy(true);
+  window.FB.login(email, pass)
+    .catch(function(e){ errEl.textContent = window.FB.translateError(e && e.code); })
+    .finally(function(){ _authBusy(false); });
+  /* On success, onAuthStateChanged -> window.onFirebaseAuth -> enterApp */
 }
 
 function doSignup() {
   const name = document.getElementById('authName').value.trim();
-  const email = document.getElementById('authEmail2').value.trim().toLowerCase();
+  const email = document.getElementById('authEmail2').value.trim();
   const pass = document.getElementById('authPass2').value;
   const errEl = document.getElementById('authError2');
   errEl.style.color = '#d32f2f';
@@ -1819,32 +1826,44 @@ function doSignup() {
   if (!name || !email || !pass) { errEl.textContent = 'Please fill in all fields.'; return; }
   if (!_validEmail(email)) { errEl.textContent = 'Please enter a valid email address.'; return; }
   if (pass.length < 6) { errEl.textContent = 'Password must be at least 6 characters.'; return; }
-  const users = _readUsers();
-  if (users[email]) { errEl.textContent = 'An account with this email already exists — sign in instead.'; return; }
-  users[email] = { name: name, pass: pass };
-  _writeUsers(users);
-  const user = { uid: email, email: email, displayName: name };
-  _saveSession(user);
-  enterApp(user);
+  if (_fbNotReady(errEl)) return;
+  _authBusy(true);
+  window.FB.signup(name, email, pass)
+    .catch(function(e){ errEl.textContent = window.FB.translateError(e && e.code); })
+    .finally(function(){ _authBusy(false); });
 }
 
-/* Prototype phase: instant guest entry, no account needed */
+/* Real Google sign-in (requires the Google provider enabled in Firebase) */
 function doGoogle() {
-  demoLogin();
-}
-
-function doReset() {
   const errEl = document.getElementById('authError');
-  errEl.style.color = '#5422B9';
-  errEl.textContent = 'Prototype mode — no password reset needed. Just create a new account to continue.';
-  setTimeout(() => { errEl.style.color = '#d32f2f'; errEl.textContent = ''; }, 4500);
+  errEl.style.color = '#d32f2f';
+  errEl.textContent = '';
+  if (_fbNotReady(errEl)) return;
+  _authBusy(true);
+  window.FB.google()
+    .catch(function(e){ errEl.textContent = window.FB.translateError(e && e.code); })
+    .finally(function(){ _authBusy(false); });
 }
 
-/* Guest / preview entry — explore instantly without an account */
+/* Send a real password-reset email via Firebase */
+function doReset() {
+  const email = document.getElementById('authEmail').value.trim();
+  const errEl = document.getElementById('authError');
+  if (!email) {
+    errEl.style.color = '#d32f2f';
+    errEl.textContent = 'Enter your email above first, then click "Forgot password?".';
+    return;
+  }
+  if (_fbNotReady(errEl)) return;
+  window.FB.reset(email)
+    .then(function(){ errEl.style.color = '#5422B9'; errEl.textContent = 'Password reset email sent — check your inbox.'; })
+    .catch(function(e){ errEl.style.color = '#d32f2f'; errEl.textContent = window.FB.translateError(e && e.code); });
+}
+
+/* Guest / preview entry — explore instantly without an account (stays local,
+ * nothing is saved to a real account). */
 function demoLogin() {
-  const user = { displayName: 'Guest', email: 'guest@prototype.local', uid: 'guest' };
-  _saveSession(user);
-  enterApp(user);
+  enterApp({ displayName: 'Guest', email: 'guest@preview.local', uid: 'guest' });
 }
 
 function enterApp(user) {
@@ -2121,7 +2140,7 @@ function openTemplate(id) {
 }
 
 function doLogout() {
-  _clearSession();
+  if (window.FB && window.FB.ready) { window.FB.logout().catch(function(){}); }
   _currentUser = null;
   document.getElementById('templateHub').style.display = 'none';
   document.getElementById('projPanel').style.display = 'none';
@@ -2174,11 +2193,94 @@ async function startApp() {
   else showDoc('moodboard');
 }
 
-/* Restore an existing prototype session, if any (runs after startApp is defined) */
-const _savedSession = _loadSession();
-if (_savedSession && _savedSession.email) {
-  enterApp(_savedSession);
-}
+/* Firebase tells us the signed-in state (on load, after login, after logout).
+ * This is called by the module script at the end of the file. */
+window.onFirebaseAuth = function(user) {
+  if (user) {
+    /* Signed in — enter the app (unless we're already in it) */
+    if (!_currentUser || _currentUser.uid !== user.uid) enterApp(user);
+  } else {
+    /* Signed out / no session. If a guest is active, leave them be; otherwise
+     * make sure the login screen is showing. */
+    if (_currentUser && _currentUser.uid === 'guest') return;
+    _currentUser = null;
+    var ov = document.getElementById('authOverlay');
+    if (ov) ov.style.display = 'flex';
+  }
+};
+</script>
+
+<!-- ===== Firebase Authentication (real, secure accounts) =====
+     Loaded as an ES module from Google's CDN. Initializes Firebase with this
+     project's PUBLIC config (safe to be here) and exposes window.FB with the
+     sign-in operations the app's classic code calls. -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/11.3.1/firebase-app.js";
+  import {
+    getAuth, onAuthStateChanged, browserLocalPersistence, setPersistence,
+    createUserWithEmailAndPassword, signInWithEmailAndPassword,
+    signOut, updateProfile, sendPasswordResetEmail,
+    GoogleAuthProvider, signInWithPopup
+  } from "https://www.gstatic.com/firebasejs/11.3.1/firebase-auth.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyCtnH-JsVfEYpfVmDDHBQmpQ78WMfveZY8",
+    authDomain: "linekit-46fba.firebaseapp.com",
+    projectId: "linekit-46fba",
+    storageBucket: "linekit-46fba.firebasestorage.app",
+    messagingSenderId: "476509074037",
+    appId: "1:476509074037:web:97744c71d7a767aa82be3c"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  try { auth.useDeviceLanguage(); } catch (e) {}
+  setPersistence(auth, browserLocalPersistence).catch(function(){});
+
+  function mapUser(u) {
+    if (!u) return null;
+    return {
+      uid: u.uid,
+      email: u.email || '',
+      displayName: u.displayName || (u.email ? u.email.split('@')[0] : 'User')
+    };
+  }
+
+  function translateError(code) {
+    const m = {
+      'auth/invalid-email': 'Please enter a valid email address.',
+      'auth/user-not-found': 'No account found with this email. Create one below.',
+      'auth/wrong-password': 'Incorrect password. Try again.',
+      'auth/invalid-credential': 'Incorrect email or password.',
+      'auth/email-already-in-use': 'An account with this email already exists — sign in instead.',
+      'auth/weak-password': 'Password must be at least 6 characters.',
+      'auth/too-many-requests': 'Too many attempts. Please wait a moment and try again.',
+      'auth/operation-not-allowed': 'This sign-in method is not enabled yet in Firebase.',
+      'auth/popup-closed-by-user': 'Google sign-in was cancelled.',
+      'auth/popup-blocked': 'Your browser blocked the Google popup. Allow popups and try again.',
+      'auth/unauthorized-domain': 'This website domain is not authorized in Firebase settings yet.',
+      'auth/network-request-failed': 'Network problem. Please check your connection.'
+    };
+    return m[code] || 'Something went wrong. Please try again.';
+  }
+
+  window.FB = {
+    ready: true,
+    translateError: translateError,
+    login: function (email, pass) { return signInWithEmailAndPassword(auth, email, pass); },
+    signup: function (name, email, pass) {
+      return createUserWithEmailAndPassword(auth, email, pass).then(function (cred) {
+        return updateProfile(cred.user, { displayName: name }).catch(function () {}).then(function () { return cred; });
+      });
+    },
+    google: function () { return signInWithPopup(auth, new GoogleAuthProvider()); },
+    logout: function () { return signOut(auth); },
+    reset: function (email) { return sendPasswordResetEmail(auth, email); }
+  };
+
+  onAuthStateChanged(auth, function (u) {
+    if (typeof window.onFirebaseAuth === 'function') window.onFirebaseAuth(mapUser(u));
+  });
 </script>
 </body>
 </html>
