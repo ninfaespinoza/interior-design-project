@@ -1498,9 +1498,10 @@ function dragUpload(e,i){
  * Photos placed on top of a template that can be dragged, resized, rotated,
  * reordered and deleted. Positions are stored per page in FREE[pid], in the
  * page's native pixel coordinate system (landscape 1120x792). Pilot: only the
- * templates listed in FREE_ENABLED_DOCS accept new free photos. To enable it
- * for every template, set FREE_ENABLED_DOCS = null. */
-var FREE_ENABLED_DOCS = ['elevations'];
+ * templates listed in FREE_ENABLED_DOCS accept new free photos. null = every
+ * template is enabled (rolled out after the Elevations pilot). To limit it
+ * again, set e.g. FREE_ENABLED_DOCS = ['elevations']. */
+var FREE_ENABLED_DOCS = null;
 function freeEnabledFor(id){ return !FREE_ENABLED_DOCS || FREE_ENABLED_DOCS.indexOf(id)>=0; }
 var _feSel=null;        /* {pid, fid} currently selected element */
 var _feDrag=null;       /* active drag/resize/rotate gesture */
@@ -1587,9 +1588,12 @@ function addFreeFromUpload(i){
     var pid=pageDocId(cur, pages[idx]);
     if(!FREE[pid]) FREE[pid]=[];
     var n=FREE[pid].length;
+    /* Center using the page's native size (portrait for Admin docs, else landscape) */
+    var portrait = DOCS[cur] && DOCS[cur].type==='admin';
+    var PW = portrait?792:1120, PH = portrait?1120:792;
     var w=360, h=270;
     var off=(n%6)*20;
-    var it={ id:feUid(), src:u.data, x:Math.round(1120/2 - w/2 + off), y:Math.round(792/2 - h/2 + off), w:w, h:h, rot:0 };
+    var it={ id:feUid(), src:u.data, x:Math.round(PW/2 - w/2 + off), y:Math.round(PH/2 - h/2 + off), w:w, h:h, rot:0 };
     FREE[pid].push(it);
     _feSel={ pid:pid, fid:it.id };
     renderAllFree();
@@ -1599,7 +1603,7 @@ function addFreeFromUpload(i){
       var ar=probe.naturalWidth/probe.naturalHeight;
       if(ar>0){
         it.h=Math.round(it.w/ar);
-        it.y=Math.round(792/2 - it.h/2 + off);
+        it.y=Math.round(PH/2 - it.h/2 + off);
         renderAllFree();
       }
       pushHistory();
