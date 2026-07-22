@@ -686,6 +686,7 @@ function pushHistory(){
   if(_hist.length>60){_hist.shift();}
   _histIdx=_hist.length-1;
   updateUndoBtns();
+  queueSave();   /* auto-save edits to the current backend (debounced) */
 }
 function pushHistoryDebounced(){
   if(!_histReady)return;
@@ -707,7 +708,7 @@ function undo(){
   applySnapshot(_hist[_histIdx]);
   showDoc(cur,true);
   updateUndoBtns();
-  saveProjectState&&saveProjectState().catch(function(){});
+  queueSave();
 }
 function redo(){
   if(_histIdx>=_hist.length-1)return;
@@ -716,7 +717,7 @@ function redo(){
   applySnapshot(_hist[_histIdx]);
   showDoc(cur,true);
   updateUndoBtns();
-  saveProjectState&&saveProjectState().catch(function(){});
+  queueSave();
 }
 function updateUndoBtns(){
   var u=document.getElementById('undoBtn'),r=document.getElementById('redoBtn');
@@ -724,7 +725,38 @@ function updateUndoBtns(){
   if(r)r.disabled=_histIdx>=_hist.length-1;
 }
 function ik(d,s){return d+'__'+s}
-function readF(f,cb){if(f.size>10485760)return alert('Max 10MB');const r=new FileReader;r.onload=e=>cb(e.target.result);r.readAsDataURL(f)}
+/* Read an image file and return a resized/compressed data URL. Keeps stored
+ * images small enough for the free cloud tier and makes saves/loads faster.
+ * Large images are scaled to a max dimension and re-encoded as JPEG; small
+ * ones pass through untouched. */
+function _readImageResized(f,cb){
+  var MAXD=2000, Q=0.85;
+  var fr=new FileReader();
+  fr.onload=function(e){
+    var url=e.target.result;
+    var img=new Image();
+    img.onload=function(){
+      var w=img.naturalWidth, h=img.naturalHeight;
+      if(!w||!h){ cb(url); return; }
+      var scale=Math.min(1, MAXD/Math.max(w,h));
+      /* Only shrink big images; leave already-small ones as-is */
+      if(scale>=1 && url.length<700000){ cb(url); return; }
+      var cw=Math.max(1,Math.round(w*scale)), ch=Math.max(1,Math.round(h*scale));
+      try{
+        var c=document.createElement('canvas'); c.width=cw; c.height=ch;
+        var ctx=c.getContext('2d');
+        ctx.fillStyle='#fff'; ctx.fillRect(0,0,cw,ch);
+        ctx.drawImage(img,0,0,cw,ch);
+        cb(c.toDataURL('image/jpeg',Q));
+      }catch(_){ cb(url); }
+    };
+    img.onerror=function(){ cb(url); };
+    img.src=url;
+  };
+  fr.onerror=function(){ cb(null); };
+  fr.readAsDataURL(f);
+}
+function readF(f,cb){if(f.size>10485760)return alert('Max 10MB');_readImageResized(f,function(url){if(url)cb(url);})}
 function slotUp(d,s,i){const inp=document.createElement('input');inp.type='file';inp.accept='image/*';inp.onchange=()=>{if(!inp.files.length)return;readF(inp.files[0],url=>{const k=ik(d,s);if(!IMG[k])IMG[k]=[];IMG[k][i]={u:url};renderSlots(d,s);pushHistory()})};inp.click()}
 function slotRm(d,s,i){const k=ik(d,s);if(IMG[k])IMG[k][i]=null;renderSlots(d,s);pushHistory()}
 function renderSlots(d,s){
@@ -764,7 +796,7 @@ function closeSwPicker(){document.getElementById('swPicker').classList.remove('s
 function pickSwColor(c){
   if(!c)return;
   if(!/^#/.test(c))c='#'+c;
-  if(_swTarget){if(!SWS[_swTarget])SWS[_swTarget]=[];SWS[_swTarget].push(c);renderSw(_swTarget);saveState();pushHistory();saveProjectState&&saveProjectState().catch(function(){})}
+  if(_swTarget){if(!SWS[_swTarget])SWS[_swTarget]=[];SWS[_swTarget].push(c);renderSw(_swTarget);saveState();pushHistory();queueSave()}
   closeSwPicker();
 }
 function swWheelChange(v){document.getElementById('swHexInput').value=v.toUpperCase()}
@@ -1380,12 +1412,26 @@ function dbDel(key){return openDB().then(db=>new Promise((res,rej)=>{
   rq.onsuccess=()=>res();rq.onerror=()=>rej(rq.error);
 }))}
 
-/* ===== PROJECTS & UPLOADS ===== */
-const LS_PROJ='idp_projects',LS_CUR='idp_curProj';
-function getProjects(){try{return JSON.parse(localStorage.getItem(LS_PROJ))||[]}catch(e){return[]}}
-function saveProjects(p){localStorage.setItem(LS_PROJ,JSON.stringify(p))}
-function getCurProj(){return localStorage.getItem(LS_CUR)||null}
-function setCurProj(id){localStorage.setItem(LS_CUR,id)}
+/* ===== PER-USER STORAGE ===== *
+ * Signed-in users -> their private Cloud Firestore space (window.FB.cloud*),
+ * so each account only ever sees its own data. Guests -> local IndexedDB
+ * (a throwaway sandbox on this device). All keys are the same in both. */
+var _isCloud = false;                          /* true when a real account is signed in */
+var _meta = { projects: [], curProj: null };   /* in-memory cache of the projects index */
+
+function storeGet(key){ return _isCloud ? window.FB.cloudGet(key) : dbGet(key); }
+function storeSet(key,val){ return _isCloud ? window.FB.cloudSet(key,val) : dbSet(key,val); }
+function storeDel(key){ return _isCloud ? window.FB.cloudDel(key) : dbDel(key); }
+
+/* Projects index is cached in memory (kept sync for the rest of the app) and
+ * written back to the current backend, debounced. */
+function getProjects(){ return _meta.projects || []; }
+function saveProjects(p){ _meta.projects = p || []; _scheduleMetaSave(); }
+function getCurProj(){ return _meta.curProj || null; }
+function setCurProj(id){ _meta.curProj = id || null; _scheduleMetaSave(); }
+var _metaSaveTimer=null;
+function _scheduleMetaSave(){ clearTimeout(_metaSaveTimer); _metaSaveTimer=setTimeout(_saveMetaNow,300); }
+function _saveMetaNow(){ clearTimeout(_metaSaveTimer); return storeSet('meta',{projects:_meta.projects,curProj:_meta.curProj}).catch(function(e){console.warn('meta save',e);}); }
 
 const PROJ_COLORS=['#5422B9','#8B6FD4','#6B3FCE','#444','#999','#5422B9','#8B6FD4','#333','#6B3FCE','#777'];
 function projColor(i){return PROJ_COLORS[i%PROJ_COLORS.length]}
@@ -1408,9 +1454,9 @@ function newProject(){
 }
 
 function switchProject(id){
-  saveProjectState().then(()=>{
+  saveProjectState().catch(function(){}).then(function(){
     setCurProj(id);
-    loadProjectState(id).then(()=>renderProjects());
+    loadProjectState(id).then(function(){renderProjects();});
   });
 }
 
@@ -1418,8 +1464,12 @@ function saveProjectState(){
   const pid=getCurProj();if(!pid)return Promise.resolve();
   saveState();
   const data={IMG:{...IMG},SWS:{...SWS},ST:{...ST},PAGES:JSON.parse(JSON.stringify(PAGES)),FREE:JSON.parse(JSON.stringify(FREE))};
-  return dbSet('pdata_'+pid,data).catch(e=>{console.warn('Save failed',e)});
+  return storeSet('pdata_'+pid,data);
 }
+/* Debounced auto-save for frequent actions (undo/redo/add swatch) so cloud
+ * writes coalesce into one instead of firing on every click. */
+var _autoSaveTimer=null;
+function queueSave(){ if(!_appReady)return; clearTimeout(_autoSaveTimer); _autoSaveTimer=setTimeout(function(){ saveProjectState().catch(function(){}); }, 1500); }
 
 function loadProjectState(pid){
   Object.keys(IMG).forEach(k=>delete IMG[k]);
@@ -1427,7 +1477,7 @@ function loadProjectState(pid){
   Object.keys(ST).forEach(k=>delete ST[k]);
   Object.keys(PAGES).forEach(k=>delete PAGES[k]);
   Object.keys(FREE).forEach(k=>delete FREE[k]);
-  return dbGet('pdata_'+pid).then(data=>{
+  return storeGet('pdata_'+pid).then(data=>{
     if(data){
       if(data.IMG)Object.assign(IMG,data.IMG);
       if(data.SWS)Object.assign(SWS,data.SWS);
@@ -1445,15 +1495,15 @@ function delProject(id){
   if(!confirm('Delete this project?'))return;
   let projs=getProjects().filter(p=>p.id!==id);
   saveProjects(projs);
-  dbDel('pdata_'+id).catch(()=>{});
+  storeDel('pdata_'+id).catch(()=>{});
   if(getCurProj()===id){
     if(projs.length){switchProject(projs[0].id)}else{setCurProj('');renderProjects()}
   }else{renderProjects()}
 }
 
-/* Uploads — stored in IndexedDB */
-function getUploads(){return dbGet('uploads').then(u=>u||[])}
-function saveUploadsDB(u){return dbSet('uploads',u)}
+/* Uploads — stored per user (cloud) or locally for guests */
+function getUploads(){return storeGet('uploads').then(u=>u||[])}
+function saveUploadsDB(u){return storeSet('uploads',u)}
 
 function renderUploads(){
   getUploads().then(upls=>{
@@ -1474,11 +1524,11 @@ function addUpload(){
       Array.from(inp.files).forEach(f=>{
         if(f.size>10485760)return;
         pending++;
-        const r=new FileReader;r.onload=e=>{
-          upls.push({name:f.name,data:e.target.result,added:Date.now()});
+        _readImageResized(f,function(url){
+          if(url)upls.push({name:f.name,data:url,added:Date.now()});
           pending--;
           if(pending<=0){saveUploadsDB(upls).then(()=>renderUploads())}
-        };r.readAsDataURL(f);
+        });
       });
     });
   };inp.click();
@@ -1872,6 +1922,8 @@ function demoLogin() {
 
 function enterApp(user) {
   _currentUser = user;
+  /* Real account -> private cloud storage; guest -> local sandbox */
+  _isCloud = !!(user && user.uid && user.uid !== 'guest' && window.FB && window.FB.ready && window.FB.cloudGet);
   const overlay = document.getElementById('authOverlay');
   if (overlay) overlay.style.display = 'none';
   // Update user pill in workspace
@@ -2122,7 +2174,7 @@ function moveTpv(e){
 function hideTpv(){ var pv=document.getElementById('tpv'); if(pv) pv.classList.remove('show'); _tpvCard=null; }
 
 function showHub() {
-  if (_appStarted) { saveState(); saveProjectState().catch(function(){}); }
+  if (_appReady) { saveState(); saveProjectState().catch(function(){}); }
   document.getElementById('templateHub').style.display = 'flex';
   document.getElementById('projPanel').style.display = 'none';
   document.getElementById('sidebarEl').style.display = 'none';
@@ -2143,9 +2195,16 @@ function openTemplate(id) {
   showDoc(id);
 }
 
-function doLogout() {
+async function doLogout() {
+  /* Save current work before leaving (while still authenticated) */
+  try { await saveProjectState(); } catch(e) {}
+  try { await _saveMetaNow(); } catch(e) {}
   if (window.FB && window.FB.ready) { window.FB.logout().catch(function(){}); }
   _currentUser = null;
+  _isCloud = false;
+  _appReady = false;
+  _clearAllState();
+  _meta = { projects: [], curProj: null };
   document.getElementById('templateHub').style.display = 'none';
   document.getElementById('projPanel').style.display = 'none';
   document.getElementById('sidebarEl').style.display = 'none';
@@ -2180,21 +2239,40 @@ function _wireEnterKeys() {
 
 setTimeout(_wireEnterKeys, 100);
 
-let _appStarted = false;
+var _startingUser = null;
+var _appReady = false;   /* true once a project is loaded and safe to auto-save */
 async function startApp() {
-  if (_appStarted) return;
-  _appStarted = true;
-  if(!getProjects().length){
+  var myUid = _currentUser ? _currentUser.uid : null;
+  _startingUser = myUid;
+  _appReady = false;
+  /* Clear any previous user's in-memory work so nothing leaks between accounts */
+  _clearAllState();
+  _meta = { projects: [], curProj: null };
+  /* Load THIS user's projects index from their own storage */
+  try {
+    var m = await storeGet('meta');
+    if (m && m.projects) _meta = { projects: m.projects || [], curProj: m.curProj || null };
+  } catch(e) { console.warn('meta load', e); }
+  /* A different user signed in while we were loading — abort this run */
+  if (_startingUser !== myUid) return;
+  /* First-time user: seed a starter project */
+  if(!_meta.projects.length){
     const id='proj_'+Date.now();
-    saveProjects([{id,name:'Villa Serena',created:Date.now()}]);
-    setCurProj(id);
-  }else if(!getCurProj()){
-    setCurProj(getProjects()[0].id);
+    _meta.projects=[{id:id,name:'Villa Serena',created:Date.now()}];
+    _meta.curProj=id;
+    _saveMetaNow();
+  } else if(!_meta.curProj){
+    _meta.curProj=_meta.projects[0].id;
+    _saveMetaNow();
   }
   renderProjects();renderUploads();
-  const pid=getCurProj();
+  const pid=_meta.curProj;
   if(pid) await loadProjectState(pid);
   else showDoc('moodboard');
+  if (_startingUser === myUid) _appReady = true;
+}
+function _clearAllState(){
+  [IMG,SWS,ST,PAGES,FREE].forEach(function(o){ Object.keys(o).forEach(function(k){ delete o[k]; }); });
 }
 
 /* Firebase tells us the signed-in state (on load, after login, after logout).
@@ -2226,6 +2304,9 @@ window.onFirebaseAuth = function(user) {
     signOut, updateProfile, sendPasswordResetEmail,
     GoogleAuthProvider, signInWithPopup
   } from "https://www.gstatic.com/firebasejs/11.3.1/firebase-auth.js";
+  import {
+    getFirestore, doc, getDoc, setDoc, deleteDoc
+  } from "https://www.gstatic.com/firebasejs/11.3.1/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyCtnH-JsVfEYpfVmDDHBQmpQ78WMfveZY8",
@@ -2240,6 +2321,54 @@ window.onFirebaseAuth = function(user) {
   const auth = getAuth(app);
   try { auth.useDeviceLanguage(); } catch (e) {}
   setPersistence(auth, browserLocalPersistence).catch(function(){});
+  const db = getFirestore(app);
+
+  /* ===== Private per-user cloud storage (Cloud Firestore) =====
+   * A tiny key/value store scoped to users/{uid}/blobs. Large values (projects
+   * with images) are split into ~500KB chunks because a Firestore document is
+   * capped at ~1MB. Security rules ensure only the owner can read/write. */
+  const CHUNK = 500000;
+  function _uid() { const u = auth.currentUser; if (!u) throw new Error('not-signed-in'); return u.uid; }
+  function _blob(uid, key) { return doc(db, 'users', uid, 'blobs', key); }
+
+  async function cloudGetRaw(key) {
+    const uid = _uid();
+    const meta = await getDoc(_blob(uid, key));
+    if (!meta.exists()) return null;
+    const d = meta.data();
+    if (!d.n) return (d.v != null ? d.v : null);      /* small value stored inline */
+    const parts = [];
+    for (let i = 0; i < d.n; i++) {
+      const cs = await getDoc(_blob(uid, key + '~' + i));
+      parts.push(cs.exists() ? (cs.data().d || '') : '');
+    }
+    return parts.join('');
+  }
+  async function cloudSetRaw(key, str) {
+    const uid = _uid();
+    const metaRef = _blob(uid, key);
+    const old = await getDoc(metaRef);
+    const oldN = old.exists() ? (old.data().n || 0) : 0;
+    if (str.length <= CHUNK) {
+      await setDoc(metaRef, { n: 0, v: str });
+    } else {
+      const n = Math.ceil(str.length / CHUNK);
+      for (let i = 0; i < n; i++) await setDoc(_blob(uid, key + '~' + i), { d: str.substr(i * CHUNK, CHUNK) });
+      await setDoc(metaRef, { n: n });
+      for (let j = n; j < oldN; j++) await deleteDoc(_blob(uid, key + '~' + j)).catch(function(){});
+    }
+    if (str.length <= CHUNK && oldN > 0) {
+      for (let k = 0; k < oldN; k++) await deleteDoc(_blob(uid, key + '~' + k)).catch(function(){});
+    }
+  }
+  async function cloudDelRaw(key) {
+    const uid = _uid();
+    const metaRef = _blob(uid, key);
+    const m = await getDoc(metaRef);
+    const n = m.exists() ? (m.data().n || 0) : 0;
+    for (let i = 0; i < n; i++) await deleteDoc(_blob(uid, key + '~' + i)).catch(function(){});
+    await deleteDoc(metaRef).catch(function(){});
+  }
 
   function mapUser(u) {
     if (!u) return null;
@@ -2279,7 +2408,11 @@ window.onFirebaseAuth = function(user) {
     },
     google: function () { return signInWithPopup(auth, new GoogleAuthProvider()); },
     logout: function () { return signOut(auth); },
-    reset: function (email) { return sendPasswordResetEmail(auth, email); }
+    reset: function (email) { return sendPasswordResetEmail(auth, email); },
+    /* Private per-user cloud key/value store */
+    cloudGet: function (key) { return cloudGetRaw(key).then(function (s) { return s == null ? null : JSON.parse(s); }); },
+    cloudSet: function (key, val) { return cloudSetRaw(key, JSON.stringify(val)); },
+    cloudDel: function (key) { return cloudDelRaw(key); }
   };
 
   onAuthStateChanged(auth, function (u) {
